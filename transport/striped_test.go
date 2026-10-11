@@ -245,7 +245,8 @@ func TestSenderGivesUpOnAGoneReceiver(t *testing.T) {
 	var q sender
 	q.init()
 	now := time.Now()
-	q.lane[0].started = true
+	q.lane[0].start(now)
+	q.lane[0].tokens = 10
 	for i := 0; i < 3; i++ {
 		q.enqueue([]byte{byte(i)})
 	}
