@@ -5,6 +5,37 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-11
+
+### Fixed
+
+- **A Telemost exit crashed with "negative shift amount"** when a client vanished mid-transfer: a piece
+  resent 255 times wrapped its retry counter to zero and the timeout's shift went negative. The counter now
+  saturates, and the sender drops a piece nobody acked for the hole deadline plus 3 s, so a gone receiver no
+  longer keeps the lanes resending.
+- **Downloads through an L4 exit sat at about 1.5 MB/s on many servers.** The exit asked for 16 MB socket
+  buffers on every outgoing connection; Linux cuts that to `net.core.rmem_max` (416 KB on a stock kernel) and
+  turns buffer autotuning off, so the exit fetched from the internet at 1.4 MB/s where the same socket left
+  alone does 42 MB/s. The buffers are left to the kernel.
+- **Script transports with `--transport=script` lost what their setup page was given** (a token, a pairing)
+  at every start: the cookie store was never opened for them. Each script now gets its own jar,
+  `./cookies-script-<name>.json` by default, under the same key the Session path uses.
+- **Telemost lanes paired by guesswork.** The SFU drops a participant's description, so the lane tags never
+  reached the other end; the tags now ride in the participant name as characters that take no space, and a
+  node pairs with the newest run of the other end at once, ghosts of earlier runs aside.
+
+### Changed
+
+- **Telemost starts with three lanes and adds more under load** (up to six; `stripes` and `stripes_max`
+  in a profile, `TELEMOST_STRIPES_MAX` in the environment). A lane is added only after 15 s of full
+  saturation: a new pair of lanes joining stops the SFU forwarding every lane for 10-15 s.
+- **Telemost lanes join as "Гость"** - no program name in the participant list or the RTCP CNAME.
+- **Steadier speed on striped carriers.** Each lane's rate follows what the SFU lets through (lanes of one
+  conference differ: 6% and 64% lost at one rate), the shared send queue lets TCP ride out the carrier's
+  swings (CoDel 150 ms / 600 ms instead of 30/250), and a lane that stops delivering keeps its stream warm
+  with copies instead of falling silent into the SFU's ramp. Between two phones on Wi-Fi, three lanes: 4.4-5
+  MB/s steady after the first seconds, against 1.2-1.7 MB/s on average before.
+
 ## [0.5.0] - 2026-10-11
 
 ### Added
