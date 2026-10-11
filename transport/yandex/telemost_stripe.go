@@ -2,11 +2,16 @@ package yandex
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/p1neappleXpress/OpenFlux/transport"
 	"github.com/p1neappleXpress/OpenFlux/utils"
@@ -24,7 +29,8 @@ import (
 // NewTelemostGroup creates n lanes joined to the same conference. The group
 // is also a transport.LaneSource, so the stripe can grow it later.
 func NewTelemostGroup(cookies, conferenceURL string, n int, isExitNode bool, config transport.TransportConfig) *TelemostGroup {
-	g := &TelemostGroup{cookies: cookies, url: conferenceURL, isExit: isExitNode, config: config}
+	g := &TelemostGroup{cookies: cookies, url: conferenceURL, isExit: isExitNode, config: config,
+		id: uuid.New().String()[:8], start: time.Now().UnixMilli()}
 	for i := 0; i < n; i++ {
 		g.newLane()
 	}
@@ -49,6 +55,64 @@ type TelemostGroup struct {
 	grow    func()
 	growing atomic.Bool
 	silent  map[string]time.Time // peers a lane watched and got nothing from
+
+	id    string // this run of the group, in every lane's tag
+	start int64  // when it started (unix ms), to tell the newest run
+}
+
+// laneTag names a lane in its participant description: role, the group (one
+// run of a node's stripe), when that run started and the lane's index. The
+// SFU keeps listing a participant that vanished without a word for minutes,
+// so after a reconnect or a restart the room is full of lanes that carry
+// nothing; a node watches only the newest group of the other role and never
+// wastes a lane, or seconds of probing, on them.
+//
+// On the wire it is short and names nothing ("c1a2b3c4d-mg3x8k2a-0": role
+// letter and group, start in base 36, index): everyone in the room can read
+// a participant description.
+type laneTag struct {
+	role  string // "exit" or "client"
+	group string // 8 hex digits
+	start int64
+	index int
+}
+
+func (l laneTag) String() string {
+	return fmt.Sprintf("%c%s-%s-%d", l.role[0], l.group, strconv.FormatInt(l.start, 36), l.index)
+}
+
+// parseLaneTag reads a lane tag; ok is false for any other description.
+func parseLaneTag(s string) (laneTag, bool) {
+	f := strings.Split(s, "-")
+	if len(f) != 3 || len(f[0]) != 9 {
+		return laneTag{}, false
+	}
+	var role string
+	switch f[0][0] {
+	case 'e':
+		role = "exit"
+	case 'c':
+		role = "client"
+	default:
+		return laneTag{}, false
+	}
+	group := f[0][1:]
+	if _, err := strconv.ParseUint(group, 16, 32); err != nil {
+		return laneTag{}, false
+	}
+	start, err1 := strconv.ParseInt(f[1], 36, 64)
+	index, err2 := strconv.Atoi(f[2])
+	if err1 != nil || err2 != nil || start <= 0 || index < 0 {
+		return laneTag{}, false
+	}
+	return laneTag{role: role, group: group, start: start, index: index}, true
+}
+
+func roleName(exit bool) string {
+	if exit {
+		return "exit"
+	}
+	return "client"
 }
 
 // Lanes returns the lanes created so far.
@@ -69,6 +133,7 @@ func (g *TelemostGroup) newLane() *TelemostTransport {
 	}
 	g.mu.Lock()
 	t.lane = &stripeLane{group: g, index: len(g.lanes), parts: map[string]tmPart{}, lastReq: -1}
+	t.laneTag = laneTag{role: roleName(g.isExit), group: g.id, start: g.start, index: len(g.lanes)}.String()
 	g.lanes = append(g.lanes, t)
 	g.mu.Unlock()
 	return t
@@ -92,6 +157,8 @@ type tmPart struct {
 	streaming bool      // publishes camera or screen
 	gone      bool      // disconnectedAt set or removed
 	since     time.Time // first seen streaming
+	tag       laneTag   // the lane tag in its description, if tagged
+	tagged    bool
 }
 
 // peerSettle is how long a peer must stream before we add a lane for it, so
@@ -135,6 +202,9 @@ func (g *TelemostGroup) recompute() {
 			q := seen[id]
 			q.streaming = q.streaming || p.streaming
 			q.gone = q.gone || p.gone
+			if p.tagged {
+				q.tag, q.tagged = p.tag, true
+			}
 			if !p.since.IsZero() && (q.since.IsZero() || p.since.Before(q.since)) {
 				q.since = p.since
 			}
@@ -147,22 +217,41 @@ func (g *TelemostGroup) recompute() {
 			delete(g.silent, id)
 		}
 	}
+	// The newest group of the other role, when the peers tag their lanes.
+	var best laneTag
+	tagged := false
+	for id, p := range seen {
+		if !p.streaming || p.gone || own[id] || !p.tagged || p.tag.role == roleName(g.isExit) {
+			continue
+		}
+		if !tagged || p.tag.start > best.start || (p.tag.start == best.start && p.tag.group > best.group) {
+			best, tagged = p.tag, true
+		}
+	}
 	var peers, quiet []string
 	settled := 0
 	for id, p := range seen {
 		if !p.streaming || p.gone || own[id] {
 			continue
 		}
-		if _, silent := g.silent[id]; silent {
+		if tagged && (!p.tagged || p.tag.group != best.group) {
+			continue // a lane of an earlier run, someone else, or our own role
+		}
+		if _, silent := g.silent[id]; silent && !tagged {
 			quiet = append(quiet, id)
 			continue
 		}
 		peers = append(peers, id)
-		if time.Since(p.since) >= peerSettle {
+		if time.Since(p.since) >= peerSettle || tagged {
 			settled++
 		}
 	}
-	sort.Strings(peers)
+	if tagged {
+		// Lane i of ours to lane i of theirs where it can: a stable order.
+		sort.Slice(peers, func(i, j int) bool { return seen[peers[i]].tag.index < seen[peers[j]].tag.index })
+	} else {
+		sort.Strings(peers)
+	}
 	sort.Strings(quiet)
 	peers = append(peers, quiet...) // the silent ones only if nothing else is left
 	lanes := append([]*TelemostTransport(nil), g.lanes...)
@@ -214,7 +303,7 @@ func (g *TelemostGroup) recompute() {
 	var silent []string
 	for _, l := range lanes {
 		l.lane.mu.Lock()
-		if l.lane.target != "" && !l.receiving() && time.Since(l.lane.targetAt) > silentAfter {
+		if !tagged && l.lane.target != "" && !l.receiving() && time.Since(l.lane.targetAt) > silentAfter {
 			silent = append(silent, l.lane.target)
 		}
 		l.lane.mu.Unlock()
@@ -320,6 +409,11 @@ func (t *TelemostTransport) onDescriptions(v interface{}, removed bool) {
 			sv, _ := m["sendVideo"].(bool)
 			ss, _ := m["sendSharing"].(bool)
 			p.streaming = sv || ss
+			if meta, ok := m["meta"].(map[string]interface{}); ok {
+				if d, ok := meta["description"].(string); ok {
+					p.tag, p.tagged = parseLaneTag(d)
+				}
+			}
 			_, dis := m["disconnectedAt"]
 			p.gone = dis
 			if p.streaming && p.since.IsZero() {

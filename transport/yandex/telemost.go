@@ -204,6 +204,10 @@ type TelemostTransport struct {
 	lastSendTime atomic.Int64
 	lastRecvTime atomic.Int64
 	videoAt      atomic.Int64 // last RTP on the subscribed video track
+
+	// laneTag goes into the participant description of a striped lane
+	// (telemost_stripe.go); empty outside a group.
+	laneTag string
 }
 
 type TelemostConnectionResponse struct {
@@ -689,7 +693,7 @@ func (t *TelemostTransport) sendHello() error {
 			ParticipantMeta: map[string]interface{}{
 				"name":        "Гость",
 				"role":        "SPEAKER",
-				"description": "",
+				"description": t.laneTag,
 				"sendAudio":   t.shareCarrier == "audio",
 				"sendVideo":   true,
 				"sendSharing": true,
@@ -752,7 +756,7 @@ func (t *TelemostTransport) sendUpdateMe() error {
 			"participantMeta": map[string]interface{}{
 				"name":        "OpenFlux",
 				"role":        "SPEAKER",
-				"description": "",
+				"description": t.laneTag,
 				"sendAudio":   t.shareCarrier == "audio",
 				"sendVideo":   t.publishKind.sendsVideo(),
 				"sendSharing": t.publishKind.sendsSharing(),
@@ -1202,6 +1206,41 @@ func newTelemostSubscriberAPI() (*webrtc.API, error) {
 	return webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine), webrtc.WithInterceptorRegistry(ir)), nil
 }
 
+// logSelectedPair logs the candidate pair ICE settled on, and every later
+// switch: which network a lane's media really takes - Wi-Fi, mobile data, a
+// TURN relay, a VPN's own interface - shows nowhere else.
+func (t *TelemostTransport) logSelectedPair(pc *webrtc.PeerConnection, role string) {
+	var it *webrtc.ICETransport
+	for _, s := range pc.GetSenders() {
+		if tr := s.Transport(); tr != nil {
+			it = tr.ICETransport()
+			break
+		}
+	}
+	if it == nil {
+		for _, r := range pc.GetReceivers() {
+			if tr := r.Transport(); tr != nil {
+				it = tr.ICETransport()
+				break
+			}
+		}
+	}
+	if it == nil {
+		return
+	}
+	show := func(p *webrtc.ICECandidatePair) {
+		if p == nil || p.Local == nil || p.Remote == nil {
+			return
+		}
+		utils.Infof("[Telemost] lane %d %s path: %s %s:%d -> %s %s:%d [%s]", t.laneIndex(), role,
+			p.Local.Typ, p.Local.Address, p.Local.Port, p.Remote.Typ, p.Remote.Address, p.Remote.Port, roleStr(t.isExitNode))
+	}
+	if p, err := it.GetSelectedCandidatePair(); err == nil {
+		show(p)
+	}
+	it.OnSelectedCandidatePairChange(show)
+}
+
 func (t *TelemostTransport) initPublisherPC() error {
 	iceServers := t.serverConfig.iceServers
 	if len(iceServers) == 0 {
@@ -1256,6 +1295,9 @@ func (t *TelemostTransport) initPublisherPC() error {
 	})
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		utils.Debugf("[Telemost] publisher ICE state=%s [%s]", state, roleStr(t.isExitNode))
+		if state == webrtc.ICEConnectionStateConnected {
+			t.logSelectedPair(pc, "publisher")
+		}
 	})
 	pc.OnICEGatheringStateChange(func(state webrtc.ICEGatheringState) {
 		utils.Debugf("[Telemost] publisher ICE gathering=%s [%s]", state, roleStr(t.isExitNode))
@@ -2091,6 +2133,9 @@ func (t *TelemostTransport) initWebRTC() error {
 	})
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		utils.Debugf("[Telemost] subscriber ICE state=%s [%s]", state, roleStr(t.isExitNode))
+		if state == webrtc.ICEConnectionStateConnected {
+			t.logSelectedPair(pc, "subscriber")
+		}
 	})
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		utils.Debugf("[Telemost] 🎥 remote track: kind=%s id=%s codec=%s [%s]",
