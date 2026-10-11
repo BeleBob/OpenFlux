@@ -23,6 +23,8 @@ All notable changes to the OpenFlux core. Format loosely follows
 - **Telemost lanes paired by guesswork.** The SFU drops a participant's description, so the lane tags never
   reached the other end; the tags now ride in the participant name as characters that take no space, and a
   node pairs with the newest run of the other end at once, ghosts of earlier runs aside.
+- **Mail.ru Docs still answered 409 on some clients** after the User-Agent fix (reported on iOS, #164):
+  the WebSocket upgrade and the API call now also send `Accept-Language`, the way a browser does.
 
 ### Changed
 
