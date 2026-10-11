@@ -667,6 +667,10 @@ func (t *TelemostTransport) pubDescKeepaliveLoop(sec int) {
 	}
 }
 
+// participantName is the name every lane shows in the room: what an
+// anonymous guest is called, nothing that names the program.
+const participantName = "Гость"
+
 func (t *TelemostTransport) sendHello() error {
 	msg := TelemostHello{
 		UID: uuid.New().String(),
@@ -688,10 +692,10 @@ func (t *TelemostTransport) sendHello() error {
 			// created a video slot - videoSlots stayed [].
 			SendSharing: true,
 			ParticipantAttributes: map[string]interface{}{
-				"name": "OpenFlux", "role": "SPEAKER", "description": "",
+				"name": participantName, "role": "SPEAKER", "description": "",
 			},
 			ParticipantMeta: map[string]interface{}{
-				"name":        "Гость",
+				"name":        participantName,
 				"role":        "SPEAKER",
 				"description": t.laneTag,
 				"sendAudio":   t.shareCarrier == "audio",
@@ -754,7 +758,7 @@ func (t *TelemostTransport) sendUpdateMe() error {
 		"uid": uuid.New().String(),
 		"updateMe": map[string]interface{}{
 			"participantMeta": map[string]interface{}{
-				"name":        "OpenFlux",
+				"name":        participantName,
 				"role":        "SPEAKER",
 				"description": t.laneTag,
 				"sendAudio":   t.shareCarrier == "audio",
@@ -762,7 +766,7 @@ func (t *TelemostTransport) sendUpdateMe() error {
 				"sendSharing": t.publishKind.sendsSharing(),
 			},
 			"participantAttributes": map[string]interface{}{
-				"name":        "OpenFlux",
+				"name":        participantName,
 				"role":        "SPEAKER",
 				"description": "",
 			},
