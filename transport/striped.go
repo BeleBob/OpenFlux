@@ -845,9 +845,8 @@ func (q *sender) pull(i, max int, now time.Time) [][]byte {
 		q.ack = nil
 	}
 	ls := &q.lane[i]
-	capped := false
 	if allowed := ls.allow(now); max-len(out) > allowed {
-		max, capped = len(out)+allowed, true
+		max = len(out) + allowed
 	}
 	dead := ls.dead(now) && q.othersAlive(i, now)
 	if dead {
@@ -922,7 +921,9 @@ func (q *sender) pull(i, max int, now time.Time) [][]byte {
 	if len(out) < max && !dead && dupOn {
 		out = q.duplicates(i, max, now, out)
 	}
-	ls.sentN(len(out)-start, capped && len(out) >= max, now)
+	// Held back: everything the tick allowed went out - by the pace or, at
+	// the ceiling, by the lane's clock.
+	ls.sentN(len(out)-start, len(out) >= max, now)
 	return out
 }
 
