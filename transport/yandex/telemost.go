@@ -95,7 +95,6 @@ type TelemostTransport struct {
 	sharingTrack *TelemostTrack
 	rtxMu        sync.Mutex
 	uplinkLoss   atomic.Uint32 // last RR fraction lost, /256
-	sfuGot       atomic.Uint64 // packets the SFU says it received (RR ext seq - lost)
 	rtxRing      [rtxRingSize]rtxEntry
 	rtxStats     struct{ asked, resent, missed atomic.Int64 }
 	publishPlan  *videoTrackPlan
@@ -205,9 +204,10 @@ type TelemostTransport struct {
 	lastRecvTime atomic.Int64
 	videoAt      atomic.Int64 // last RTP on the subscribed video track
 
-	// laneTag goes into the participant description of a striped lane
-	// (telemost_stripe.go); empty outside a group.
-	laneTag string
+	// laneName is the participant name of a striped lane: participantName
+	// with the lane's tag hidden after it (telemost_stripe.go); empty
+	// outside a group.
+	laneName string
 }
 
 type TelemostConnectionResponse struct {
@@ -671,6 +671,14 @@ func (t *TelemostTransport) pubDescKeepaliveLoop(sec int) {
 // anonymous guest is called, nothing that names the program.
 const participantName = "Гость"
 
+// name is the participant name this lane joins under.
+func (t *TelemostTransport) name() string {
+	if t.laneName != "" {
+		return t.laneName
+	}
+	return participantName
+}
+
 func (t *TelemostTransport) sendHello() error {
 	msg := TelemostHello{
 		UID: uuid.New().String(),
@@ -692,12 +700,12 @@ func (t *TelemostTransport) sendHello() error {
 			// created a video slot - videoSlots stayed [].
 			SendSharing: true,
 			ParticipantAttributes: map[string]interface{}{
-				"name": participantName, "role": "SPEAKER", "description": "",
+				"name": t.name(), "role": "SPEAKER", "description": "",
 			},
 			ParticipantMeta: map[string]interface{}{
-				"name":        participantName,
+				"name":        t.name(),
 				"role":        "SPEAKER",
-				"description": t.laneTag,
+				"description": "",
 				"sendAudio":   t.shareCarrier == "audio",
 				"sendVideo":   true,
 				"sendSharing": true,
@@ -758,15 +766,15 @@ func (t *TelemostTransport) sendUpdateMe() error {
 		"uid": uuid.New().String(),
 		"updateMe": map[string]interface{}{
 			"participantMeta": map[string]interface{}{
-				"name":        participantName,
+				"name":        t.name(),
 				"role":        "SPEAKER",
-				"description": t.laneTag,
+				"description": "",
 				"sendAudio":   t.shareCarrier == "audio",
 				"sendVideo":   t.publishKind.sendsVideo(),
 				"sendSharing": t.publishKind.sendsSharing(),
 			},
 			"participantAttributes": map[string]interface{}{
-				"name":        participantName,
+				"name":        t.name(),
 				"role":        "SPEAKER",
 				"description": "",
 			},
@@ -1768,10 +1776,18 @@ func (t *TelemostTransport) runPublisherKeepalive() {
 		// aggregate rate this tick unchanged while making that reordering,
 		// and the costly stall-and-retransmit cycle it was triggering, far
 		// less likely.
+		// Each frame has its slot in the tick, kept against the tick's
+		// start: a sleep that overshoots (a millisecond is common on a
+		// phone) is made up by the next frames instead of piling up until
+		// the tick overruns and the ticker drops ticks - which cut a lane
+		// well below its clock's rate.
 		gap := frameInterval / time.Duration(len(frames))
+		tickStart := time.Now()
 		for i, payload := range frames {
 			if i > 0 && publishPace {
-				time.Sleep(gap)
+				if d := time.Until(tickStart.Add(time.Duration(i) * gap)); d > 0 {
+					time.Sleep(d)
+				}
 			}
 			// Hand over the raw wire frame, not a VP8 frame: sendFrame does
 			// the wrapping. Passing an already-wrapped frame in here wrapped
@@ -1948,7 +1964,6 @@ func (t *TelemostTransport) answerNACKs(b []byte) {
 		if rr, ok := p.(*rtcp.ReceiverReport); ok {
 			for _, rep := range rr.Reports {
 				t.uplinkLoss.Store(uint32(rep.FractionLost))
-				t.sfuGot.Store(uint64(rep.LastSequenceNumber) - uint64(rep.TotalLost))
 			}
 			continue
 		}

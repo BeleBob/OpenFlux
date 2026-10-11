@@ -17,6 +17,29 @@ func TestLaneTagRoundTrip(t *testing.T) {
 	if s := in.String(); strings.Contains(strings.ToLower(s), "openflux") || len(s) > 24 {
 		t.Errorf("tag %q", s)
 	}
+	for _, tag := range []laneTag{in, {role: "exit", group: "ffffffff", start: 1<<47 - 1, index: 63}, {role: "client", group: "00000000", start: 1, index: 0}} {
+		name := participantName + tag.hidden()
+		got, ok := parseHiddenTag(name)
+		if !ok || got != tag {
+			t.Errorf("hidden %+v came back as %+v, %v", tag, got, ok)
+		}
+		visible := strings.Map(func(r rune) rune {
+			for _, m := range tagMarks {
+				if r == m {
+					return -1
+				}
+			}
+			return r
+		}, name)
+		if visible != participantName {
+			t.Errorf("the name shows as %q", visible)
+		}
+	}
+	for _, n := range []string{"", participantName, "Гость\u200b", participantName + in.hidden()[:20]} {
+		if _, ok := parseHiddenTag(n); ok {
+			t.Errorf("%q parsed as a hidden tag", n)
+		}
+	}
 	for _, s := range []string{"", "Гость", "c1a2b3c4d", "c1a2b3c4d-1", "x1a2b3c4d-mg3x8k2a-0", "c1a2b3c4-mg3x8k2a-0",
 		"c1a2b3c4z-mg3x8k2a-0", "c1a2b3c4d-!-0", "c1a2b3c4d-0-0", "c1a2b3c4d-mg3x8k2a--1", "c1a2b3c4d-mg3x8k2a-0-1"} {
 		if _, ok := parseLaneTag(s); ok {

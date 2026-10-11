@@ -1,6 +1,7 @@
 package yandex
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -67,9 +68,11 @@ type TelemostGroup struct {
 // nothing; a node watches only the newest group of the other role and never
 // wastes a lane, or seconds of probing, on them.
 //
-// On the wire it is short and names nothing ("c1a2b3c4d-mg3x8k2a-0": role
-// letter and group, start in base 36, index): everyone in the room can read
-// a participant description.
+// The SFU passes a participant's name through untouched but drops the
+// description (every peer sees "description":""), so the tag rides in the
+// name: after the name everyone sees (participantName) come characters that
+// take no space, two bits each (laneTag.hidden). String is the readable form
+// for logs.
 type laneTag struct {
 	role  string // "exit" or "client"
 	group string // 8 hex digits
@@ -79,6 +82,65 @@ type laneTag struct {
 
 func (l laneTag) String() string {
 	return fmt.Sprintf("%c%s-%s-%d", l.role[0], l.group, strconv.FormatInt(l.start, 36), l.index)
+}
+
+// tagMarks write a hidden lane tag: zero width space, zero width non-joiner,
+// zero width joiner and word joiner - nothing a name shows.
+var tagMarks = [4]rune{'\u200b', '\u200c', '\u200d', '\u2060'}
+
+// hidden is the tag as name characters that take no space: a two-mark
+// header, then 11 bytes - role and index, group, start (unix ms, 48 bits) -
+// four marks a byte.
+func (l laneTag) hidden() string {
+	g, _ := strconv.ParseUint(l.group, 16, 32)
+	var b [11]byte
+	b[0] = byte(l.index & 0x7f)
+	if l.role == "exit" {
+		b[0] |= 0x80
+	}
+	binary.BigEndian.PutUint32(b[1:5], uint32(g))
+	st := uint64(l.start)
+	for i := 0; i < 6; i++ {
+		b[5+i] = byte(st >> (8 * (5 - i)))
+	}
+	var sb strings.Builder
+	sb.WriteRune(tagMarks[3])
+	sb.WriteRune(tagMarks[3])
+	for _, x := range b {
+		for sh := 6; sh >= 0; sh -= 2 {
+			sb.WriteRune(tagMarks[(x>>sh)&3])
+		}
+	}
+	return sb.String()
+}
+
+// parseHiddenTag reads a tag hidden in a participant name.
+func parseHiddenTag(name string) (laneTag, bool) {
+	var d []byte
+	for _, r := range name {
+		for i, m := range tagMarks {
+			if r == m {
+				d = append(d, byte(i))
+			}
+		}
+	}
+	if len(d) != 2+11*4 || d[0] != 3 || d[1] != 3 {
+		return laneTag{}, false
+	}
+	var b [11]byte
+	for i := range b {
+		b[i] = d[2+4*i]<<6 | d[3+4*i]<<4 | d[4+4*i]<<2 | d[5+4*i]
+	}
+	role := "client"
+	if b[0]&0x80 != 0 {
+		role = "exit"
+	}
+	var st uint64
+	for i := 0; i < 6; i++ {
+		st = st<<8 | uint64(b[5+i])
+	}
+	return laneTag{role: role, group: fmt.Sprintf("%08x", binary.BigEndian.Uint32(b[1:5])),
+		start: int64(st), index: int(b[0] & 0x7f)}, st > 0
 }
 
 // parseLaneTag reads a lane tag; ok is false for any other description.
@@ -133,7 +195,8 @@ func (g *TelemostGroup) newLane() *TelemostTransport {
 	}
 	g.mu.Lock()
 	t.lane = &stripeLane{group: g, index: len(g.lanes), parts: map[string]tmPart{}, lastReq: -1}
-	t.laneTag = laneTag{role: roleName(g.isExit), group: g.id, start: g.start, index: len(g.lanes)}.String()
+	tag := laneTag{role: roleName(g.isExit), group: g.id, start: g.start, index: len(g.lanes)}
+	t.laneName = participantName + tag.hidden()
 	g.lanes = append(g.lanes, t)
 	g.mu.Unlock()
 	return t
@@ -410,7 +473,10 @@ func (t *TelemostTransport) onDescriptions(v interface{}, removed bool) {
 			ss, _ := m["sendSharing"].(bool)
 			p.streaming = sv || ss
 			if meta, ok := m["meta"].(map[string]interface{}); ok {
-				if d, ok := meta["description"].(string); ok {
+				if n, ok := meta["name"].(string); ok {
+					p.tag, p.tagged = parseHiddenTag(n)
+				}
+				if d, ok := meta["description"].(string); ok && !p.tagged {
 					p.tag, p.tagged = parseLaneTag(d)
 				}
 			}
@@ -521,9 +587,6 @@ func (t *TelemostTransport) SetFrameSource(src func(max int) [][]byte) { t.frame
 // UplinkLoss is the fraction of our published packets the SFU reported lost
 // in its latest Receiver Report.
 func (t *TelemostTransport) UplinkLoss() float64 { return float64(t.uplinkLoss.Load()) / 256 }
-
-// UplinkReceived is the cumulative packet count the SFU reports receiving.
-func (t *TelemostTransport) UplinkReceived() uint64 { return t.sfuGot.Load() }
 
 // LaneID is this lane's participant id in the room.
 func (t *TelemostTransport) LaneID() string { return t.peerID }
