@@ -45,13 +45,15 @@ func TestEveryNativeTypeBuilds(t *testing.T) {
 	}
 }
 
-// A Telemost carrier runs five lanes unless its profile says otherwise.
+// A Telemost carrier starts with three lanes unless its profile says
+// otherwise.
 func TestTelemostLaneCount(t *testing.T) {
 	t.Setenv("TELEMOST_STRIPES", "")
+	t.Setenv("TELEMOST_STRIPES_MAX", "")
 	cases := []struct {
 		stripes interface{}
 		want    int
-	}{{nil, 5}, {"2", 2}, {float64(7), 7}, {"auto", 3}, {"nonsense", 5}}
+	}{{nil, 3}, {"2", 2}, {float64(7), 7}, {"auto", 3}, {"nonsense", 3}}
 	for _, c := range cases {
 		params := map[string]interface{}{}
 		if c.stripes != nil {
