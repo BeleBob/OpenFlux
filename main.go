@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	godebug "runtime/debug"
 	"strconv"
@@ -104,14 +105,40 @@ const (
 	codecLegacy  = "legacy"
 )
 
-// transportHasCookies reports whether the given transport uses HTTP cookies
-// that can be refreshed via the NegotiatedTransport control channel.
+// transportHasCookies reports whether the given transport keeps state in the
+// cookie store: HTTP cookies that can be refreshed via the
+// NegotiatedTransport control channel, or - a script - what its setup page
+// was given (see sessionCookieKey).
 func transportHasCookies(t string) bool {
 	switch t {
-	case "yandex", "vyandex", "boards", "mailru", "cupsonline":
+	case "yandex", "vyandex", "boards", "mailru", "cupsonline", "script":
 		return true
 	}
 	return false
+}
+
+// defaultCookieStorePath is the jar used without --cookie-store: one per
+// transport type in the current directory, and one per script - two scripts
+// must not share a jar. A script is named by --script-name, else by its
+// file.
+func defaultCookieStorePath(transportType, scriptName, scriptPath string) string {
+	if transportType == "script" {
+		name := scriptName
+		if name == "" && scriptPath != "" {
+			name = strings.TrimSuffix(filepath.Base(scriptPath), filepath.Ext(scriptPath))
+		}
+		name = strings.Map(func(r rune) rune {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+				return r
+			}
+			return '_'
+		}, name)
+		if name = strings.Trim(name, "."); name != "" {
+			return "./cookies-script-" + name + ".json"
+		}
+	}
+	return fmt.Sprintf("./cookies-%s.json", transportType)
 }
 
 // sessionCookieKey is cookieKey for a transport of a Session. A script
@@ -225,7 +252,8 @@ func main() {
 	negotiate := flag.Bool("negotiate", false, "Require encrypted, session-bound IPv4 capability negotiation on both peers (no legacy fallback)")
 	maxPacket := flag.Int("max-packet-size", transport.MaxNegotiatedPacket, "Maximum IPv4 packet in negotiated mode (1280..65000); not the Internet path MTU")
 	cookieStorePath := flag.String("cookie-store", "",
-		"Path to the cookie jar file. Default: ./cookies-<transport>.json in the current directory. "+
+		"Path to the cookie jar file. Default: ./cookies-<transport>.json in the current directory "+
+			"(./cookies-script-<name>.json for a script). "+
 			"Ignored for transports without cookies (direct, oneme).")
 	encryptionKeyFile := flag.String("encryption-key-file", "",
 		"Optional: encrypt the transport with AES-256-GCM using a shared secret read from this file. "+
@@ -370,7 +398,8 @@ TRANSPORT MODIFIERS
                                on both peers. No legacy fallback.
       --max-packet-size=N      Max IPv4 packet in negotiated mode
                                (1280..65000). Default 65000.
-      --cookie-store=<path>    Cookie jar file. Default: ./cookies-<transport>.json.
+      --cookie-store=<path>    Cookie jar file. Default: ./cookies-<transport>.json
+                               (./cookies-script-<name>.json for a script).
       --ipc-socket=<path>      Unix domain socket for the mobile bridge.
                                Empty = no IPC server.
       --share                  Exit: print an openflux:// link and QR code for
@@ -685,7 +714,7 @@ DEPRECATED (removed in v2)
 	if transportHasCookies(*transportType) {
 		path := *cookieStorePath
 		if path == "" {
-			path = fmt.Sprintf("./cookies-%s.json", *transportType)
+			path = defaultCookieStorePath(*transportType, *scriptName, *scriptPath)
 		}
 		s, err := transport.NewCookieStore(path)
 		if err != nil {
@@ -881,7 +910,7 @@ DEPRECATED (removed in v2)
 		// saved; the Manager routes cookie control messages by name.
 		if store != nil {
 			for _, spec := range specs {
-				if !transportHasCookies(spec.Type) && spec.Type != "script" {
+				if !transportHasCookies(spec.Type) {
 					continue
 				}
 				if err := managerInst.UseCookieStore(store, spec.Name, sessionCookieKey(spec, maxUid)); err != nil {
@@ -959,7 +988,9 @@ DEPRECATED (removed in v2)
 		// Persist cookie exchanger for the legacy path.
 		if store != nil {
 			if ce, ok := inner.(transport.CookieExchanger); ok {
-				key := cookieKey(*transportType, globalDocUrl, maxUid)
+				// The key the Session path uses too, so a jar carries over
+				// when a key is added or removed.
+				key := sessionCookieKey(specs[0], maxUid)
 				if jar := store.Load(key); jar != nil {
 					_ = ce.ApplyCookies(jar)
 				}
