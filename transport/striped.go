@@ -612,9 +612,9 @@ func (s *StripedTransport) statsLoop() {
 		}
 		utils.Packetf("[STRIPE] per-lane %s | arrival gaps 1:%d 2-3:%d 4-7:%d 8-15:%d 16-31:%d 32-63:%d 64-127:%d 128+:%d",
 			strings.Join(per, " "), gaps[0], gaps[1], gaps[2], gaps[3], gaps[4], gaps[5], gaps[6], gaps[7])
-		utils.Packetf("[STRIPE] farWatches=%d lanes up=%d/%d | rx delivered=%d skipped=%d late=%d buffered=%d acks=%d | tx pieces=%d rtx=%d (rto %d) dups=%d inflight=%d queue=%dKB/%dms codelDrop=%d sendDropped=%d acks=%d srtt=%s rto=%s | uplinkLoss=%.1f%% cap=%.0fKB/s",
+		utils.Packetf("[STRIPE] farWatches=%d lanes up=%d/%d | rx delivered=%d skipped=%d late=%d buffered=%d acks=%d | tx pieces=%d rtx=%d (rto %d) dups=%d gaveUp=%d inflight=%d queue=%dKB/%dms codelDrop=%d sendDropped=%d acks=%d srtt=%s rto=%s | uplinkLoss=%.1f%% cap=%.0fKB/s",
 			nw, up, len(lanes), d, sk, late, buffered, s.ackSent.Load(),
-			ss.pieces, ss.rtx, ss.rtxTimeout, ss.dups, ss.inflight, ss.queueBytes/1024, ss.queueDelay.Milliseconds(), ss.codelDrops, s.dropped.Load(), s.ackRecv.Load(),
+			ss.pieces, ss.rtx, ss.rtxTimeout, ss.dups, ss.gaveUp, ss.inflight, ss.queueBytes/1024, ss.queueDelay.Milliseconds(), ss.codelDrops, s.dropped.Load(), s.ackRecv.Load(),
 			ss.srtt.Round(time.Millisecond), ss.rto.Round(time.Millisecond), loss*100, s.getCap()/1000)
 	}
 }
@@ -834,6 +834,7 @@ type sender struct {
 	pieces  uint64
 	rtx     uint64
 	dupSent uint64
+	gaveUp  uint64
 	rtxTime uint64 // retransmissions caused by the timeout, not by acks
 
 	laneTx  [maxStripeLanes]uint64 // transmissions per lane, in send order
@@ -862,6 +863,7 @@ type txEntry struct {
 	lane    uint8
 	laneIdx uint64 // laneTx[lane] when it last left
 	at      time.Time
+	born    time.Time // when it first left
 	tries   uint8
 }
 
@@ -933,7 +935,9 @@ func (q *sender) pull(i, max int, now time.Time) [][]byte {
 				continue
 			}
 			e.queued = false
-			e.tries++
+			if e.tries < 255 {
+				e.tries++
+			}
 			e.dups = 0
 			if e.tries == 4 && now.Sub(q.triesLogAt) > time.Second {
 				q.triesLogAt = now
@@ -960,7 +964,7 @@ func (q *sender) pull(i, max int, now time.Time) [][]byte {
 		binary.BigEndian.PutUint32(buf[5:9], q.low)
 		copy(buf[stripeHeader:], p)
 		e := &q.ring[q.seq%txRingSize]
-		*e = txEntry{seq: q.seq, buf: buf, ok: true, tries: 1}
+		*e = txEntry{seq: q.seq, buf: buf, ok: true, tries: 1, born: now}
 		q.stamp(e, i, now)
 		q.pieces++
 		out = append(out, buf)
@@ -1226,12 +1230,23 @@ func (q *sender) detectLocked(now time.Time) bool {
 	added := false
 	for x := q.low; seqBefore(x, q.seq+1); x++ {
 		e := &q.ring[x%txRingSize]
-		if !e.ok || e.seq != x || e.queued {
+		if !e.ok || e.seq != x {
+			continue
+		}
+		if now.Sub(e.born) > giveUpAfter {
+			// Nobody has acked it for this long: the receiver skipped the
+			// hole long ago, or is gone. Resending it forever would only
+			// keep the lanes busy and the ring full.
+			e.ok, e.buf, e.queued = false, nil, false
+			q.gaveUp++
+			continue
+		}
+		if e.queued {
 			continue
 		}
 		byLane := q.laneAck[e.lane] > e.laneIdx+laneReorderSlack
 		if !byLane {
-			wait := rto << min(int(e.tries)-1, 1)
+			wait := rto << min(max(int(e.tries)-1, 0), 1)
 			if now.Sub(e.at) < wait {
 				continue
 			}
@@ -1242,8 +1257,20 @@ func (q *sender) detectLocked(now time.Time) bool {
 		q.rtxQ = append(q.rtxQ, x)
 		added = true
 	}
+	// What was given up on or acked out of order no longer holds the window.
+	for seqBefore(q.low, q.seq+1) {
+		if e := &q.ring[q.low%txRingSize]; e.ok && e.seq == q.low {
+			break
+		}
+		q.low++
+	}
 	return added
 }
+
+// giveUpAfter is how long the sender keeps resending a piece: longer than the
+// receiver waits on a hole (holeDeadline), so a live receiver has given up
+// on it first.
+var giveUpAfter = holeDeadline + 3*time.Second
 
 // tickLanes rolls the lanes' loss figures.
 func (q *sender) tickLanes(now time.Time) {
@@ -1262,17 +1289,17 @@ func (q *sender) backlogged() bool {
 }
 
 type senderStats struct {
-	pieces, rtx, rtxTimeout, codelDrops, dups uint64
-	inflight, queueBytes                      int
-	queueDelay, srtt, rto                     time.Duration
-	laneLoss                                  [maxStripeLanes]float64
-	laneDead                                  [maxStripeLanes]bool
+	pieces, rtx, rtxTimeout, codelDrops, dups, gaveUp uint64
+	inflight, queueBytes                              int
+	queueDelay, srtt, rto                             time.Duration
+	laneLoss                                          [maxStripeLanes]float64
+	laneDead                                          [maxStripeLanes]bool
 }
 
 func (q *sender) snapshot() senderStats {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	st := senderStats{pieces: q.pieces, rtx: q.rtx, rtxTimeout: q.rtxTime, codelDrops: q.codelDrops, dups: q.dupSent,
+	st := senderStats{pieces: q.pieces, rtx: q.rtx, rtxTimeout: q.rtxTime, codelDrops: q.codelDrops, dups: q.dupSent, gaveUp: q.gaveUp,
 		inflight: int(q.seq + 1 - q.low), queueBytes: q.queueBytes, srtt: q.srtt, rto: q.rto()}
 	for i := range q.lane {
 		st.laneLoss[i], st.laneDead[i] = q.lane[i].loss, q.lane[i].dead(time.Now())
