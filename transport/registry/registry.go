@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/avito"
 	"github.com/p1neappleXpress/OpenFlux/transport/cupsonline"
 	"github.com/p1neappleXpress/OpenFlux/transport/mailru"
 	"github.com/p1neappleXpress/OpenFlux/transport/oneme"
@@ -35,6 +36,8 @@ type Options struct {
 	// YandexCookiesFile is the CLI's --yandex-cookies-file: a cookies.txt every
 	// vyandex transport starts with.
 	YandexCookiesFile string
+	// AvitoCookies is the raw cookie string for code.avito.ru.
+	AvitoCookies string
 	// StrictDirect makes a direct transport without an address an error (the
 	// apps tell the user); without it the CLI's behavior stays: the transport
 	// fails when it starts.
@@ -45,7 +48,7 @@ type Options struct {
 // existed; moving every user-facing word out of the core is a separate step.
 
 // Types are the transport types New accepts, in the order the apps list them.
-var Types = []string{"yandex", "vyandex", "boards", "mailru", "cupsonline", "oneme", "direct", "script"}
+var Types = []string{"yandex", "vyandex", "boards", "mailru", "cupsonline", "avito", "oneme", "direct", "script"}
 
 // New builds the raw carrier of the given type. params carries what a type
 // needs beyond its url: "token"/"uid" (and "exit") for oneme, "dial"/"listen"
@@ -82,6 +85,8 @@ func New(typ, url string, params map[string]interface{}, o Options) (transport.T
 		return mailru.NewMailruDocsTransport(url, base), nil
 	case "cupsonline":
 		return cupsonline.NewCupsonlineTransport(url, base, !o.IsExit), nil
+	case "avito":
+		return avito.NewAvitoTransport(url, base, o.AvitoCookies, !o.IsExit), nil
 	case "oneme":
 		uid, _ := strconv.ParseInt(str("uid"), 10, 64)
 		return oneme.NewOneMeTransport(roleParam(params, "exit", o.IsExit), str("token"), uid, base), nil

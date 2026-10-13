@@ -107,10 +107,34 @@ const (
 // that can be refreshed via the NegotiatedTransport control channel.
 func transportHasCookies(t string) bool {
 	switch t {
-	case "yandex", "vyandex", "boards", "mailru", "cupsonline":
+	case "yandex", "vyandex", "boards", "mailru", "cupsonline", "avito":
 		return true
 	}
 	return false
+}
+
+func loadAvitoCookies(s string) string {
+	// If it looks like a file path, try to load Netscape cookies.txt.
+	if strings.ContainsAny(s, "/\\.") {
+		data, err := os.ReadFile(s)
+		if err == nil {
+			var parts []string
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.Replace(line, "#HttpOnly_", "", 1)
+				if !strings.Contains(line, "\t") {
+					continue
+				}
+				fields := strings.Split(line, "\t")
+				if len(fields) >= 7 {
+					parts = append(parts, fields[5]+"="+fields[6])
+				}
+			}
+			if len(parts) > 0 {
+				return strings.Join(parts, "; ")
+			}
+		}
+	}
+	return s
 }
 
 // sessionCookieKey is cookieKey for a transport of a Session. A script
@@ -248,6 +272,8 @@ func main() {
 	boardsURL := flag.String("boards-url", "", "URL for the boards transport")
 	mailruURL := flag.String("mailru-url", "", "URL (weblink) for the mailru transport")
 	cupsonlineURL := flag.String("cupsonline-url", "", "URL for the cupsonline transport")
+	avitoURL := flag.String("avito-url", "", "URL for the avito transport")
+	avitoCookies := flag.String("avito-cookies", "", "Raw cookie string for code.avito.ru (or path to Netscape cookies.txt)")
 	onemeToken := flag.String("oneme-token", "", "MAX token for the oneme transport")
 	onemeUID := flag.String("oneme-uid", "", "MAX uid for the oneme transport")
 	scriptPath := flag.String("script-path", "", "Path to the script transport's <name>.flux or <name>.js (needs <name>.js.sig beside a bare .js)")
@@ -304,6 +330,7 @@ TRANSPORT  (single-transport mode)
   -t, --transport=vyandex      Yandex.Volga over HTTP relay + WS.
   -t, --transport=oneme        MAX (VK) over WebRTC.
   -t, --transport=cupsonline   Cups.online interview rooms.
+  -t, --transport=avito        code.avito.ru ShareDB rooms.
   -t, --transport=mailru       Mail.ru Docs over WebSocket.
   -t, --transport=direct       Plain TCP to a self-hosted exit.
   -t, --transport=script       A signed JS (goja) transport. Session only
@@ -325,6 +352,9 @@ TRANSPORTS  (multi-transport session; requires --encryption-key-file)
       --boards-url=<URL>       URL for the boards transport.
       --mailru-url=<WEBLINK>   Weblink for the mailru transport.
       --cupsonline-url=<URL>   URL for the cupsonline transport.
+      --avito-url=<URL>        URL for the avito transport.
+      --avito-cookies=<str>    Raw cookie string or path to Netscape
+                               cookies.txt for code.avito.ru.
       --oneme-token=<token>    MAX auth token for the oneme transport.
       --oneme-uid=<uid>        MAX user id for the oneme transport.
       --direct-dial=<addr>     DirectTransport: exit host:port (client).
@@ -674,6 +704,11 @@ DEPRECATED (removed in v2)
 		log.Printf("Cookie store: %s", path)
 	}
 
+	// Avito cookies: load from file or use as raw string.
+	if *avitoCookies != "" {
+		avitoCookiesStr = loadAvitoCookies(*avitoCookies)
+	}
+
 	// Build the list of transports to run. Two modes:
 	//   --transports=direct:100,yandex:50  -> multi-transport session
 	//   --transport=<type>                 -> legacy single-transport mode
@@ -690,6 +725,7 @@ DEPRECATED (removed in v2)
 			"boards":     *boardsURL,
 			"mailru":     *mailruURL,
 			"cupsonline": *cupsonlineURL,
+			"avito":      *avitoURL,
 		}
 		specs = buildTransportSpecs(specs, urls, nil)
 	} else if *transportsFlag != "" {
@@ -703,6 +739,7 @@ DEPRECATED (removed in v2)
 			"boards":     *boardsURL,
 			"mailru":     *mailruURL,
 			"cupsonline": *cupsonlineURL,
+			"avito":      *avitoURL,
 		}
 		if globalDocUrl != "" && globalDocUrl != "http://#" && urls["yandex"] == "" {
 			urls["yandex"] = globalDocUrl
@@ -911,13 +948,13 @@ DEPRECATED (removed in v2)
 		// Session needs one), or a bench role.
 		// The types the classic path serves; the registry builds them.
 		switch *transportType {
-		case "boards", "vyandex", "yandex", "oneme", "cupsonline", "mailru":
+		case "boards", "vyandex", "yandex", "oneme", "cupsonline", "avito", "mailru":
 		default:
 			log.Fatalf("Unknown transport type: %s", *transportType)
 		}
 		inner, err := registry.New(*transportType, globalDocUrl,
 			map[string]interface{}{"token": maxToken, "uid": maxUid, "exit": isExit},
-			registry.Options{Base: config, IsExit: isExit, YandexCookiesFile: yandexCookiesFile})
+			registry.Options{Base: config, IsExit: isExit, YandexCookiesFile: yandexCookiesFile, AvitoCookies: avitoCookiesStr})
 		if err != nil {
 			log.Fatalf("%s: %v", *transportType, err)
 		}
@@ -1148,7 +1185,7 @@ func streamCarrier(transportType, url string) phpbox.Carrier {
 		log.Fatalf("--mode=stream: transport %q not supported (use cupsonline, yandex, vyandex, mailru)", transportType)
 	}
 	t, err := registry.New(transportType, url, nil, registry.Options{
-		Base: transport.DefaultConfig(), YandexCookiesFile: yandexCookiesFile,
+		Base: transport.DefaultConfig(), YandexCookiesFile: yandexCookiesFile, AvitoCookies: avitoCookiesStr,
 	})
 	if err != nil {
 		log.Fatalf("--mode=stream %s: %v", transportType, err)
