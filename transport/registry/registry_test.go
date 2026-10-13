@@ -45,6 +45,34 @@ func TestEveryNativeTypeBuilds(t *testing.T) {
 	}
 }
 
+// A Telemost carrier starts with three lanes unless its profile says
+// otherwise.
+func TestTelemostLaneCount(t *testing.T) {
+	t.Setenv("TELEMOST_STRIPES", "")
+	t.Setenv("TELEMOST_STRIPES_MAX", "")
+	cases := []struct {
+		stripes interface{}
+		want    int
+	}{{nil, 3}, {"2", 2}, {float64(7), 7}, {"auto", 3}, {"nonsense", 3}}
+	for _, c := range cases {
+		params := map[string]interface{}{}
+		if c.stripes != nil {
+			params["stripes"] = c.stripes
+		}
+		tr, err := New("telemost", "https://telemost.yandex.ru/j/1", params, opts())
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, ok := tr.(*transport.StripedTransport)
+		if !ok {
+			t.Fatalf("telemost built %T", tr)
+		}
+		if got := st.LaneCount(); got != c.want {
+			t.Errorf("stripes=%v: %d lanes, want %d", c.stripes, got, c.want)
+		}
+	}
+}
+
 func TestEveryListedTypeIsKnown(t *testing.T) {
 	for _, typ := range Types {
 		_, err := New(typ, "x", map[string]interface{}{"dial": "127.0.0.1:1", "path": "/nope", "pubkey": strings.Repeat("00", 32)}, opts())

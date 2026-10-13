@@ -161,8 +161,9 @@ func (h *Host) listenLocked() error {
 	}
 	h.ln = ln
 	h.pageURL = "http://" + ln.Addr().String() + "/"
-	h.srv = &http.Server{Handler: http.HandlerFunc(h.serve), ReadHeaderTimeout: 10 * time.Second}
-	go func() { _ = h.srv.Serve(ln) }()
+	srv := &http.Server{Handler: http.HandlerFunc(h.serve), ReadHeaderTimeout: 10 * time.Second}
+	h.srv = srv
+	go func() { _ = srv.Serve(ln) }()
 	return nil
 }
 

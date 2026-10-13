@@ -158,6 +158,81 @@ func TestCaptchaOverIPC(t *testing.T) {
 	t.Fatalf("cookies not applied: %+v", raw.getJar())
 }
 
+// The classic path has no Session and no manager: the carrier's own check
+// (SmartCaptcha) must still reach the app, and the cookies the app answers
+// with must reach the carrier.
+func TestCaptchaClassic(t *testing.T) {
+	raw := &e2eTransport{}
+	sock := filepath.Join(t.TempDir(), "oflx.sock")
+	srv := ipc.NewServer(sock, &coreIPCHandler{exchanger: raw})
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	if !wireCheckNotifier(raw, srv) {
+		t.Fatal("a carrier that raises checks was not wired")
+	}
+
+	cli, err := ipc.Dial(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	asked := make(chan ipc.CookiesRequestPayload, 1)
+	cli.SetHandler(func(typ ipc.MsgType, payload []byte) {
+		if typ != ipc.MsgCookiesRequest {
+			return
+		}
+		var req ipc.CookiesRequestPayload
+		if err := ipc.DecodeJSON(payload, &req); err != nil {
+			return
+		}
+		asked <- req
+		_ = cli.SendCookiesOffer(&ipc.CookiesOfferPayload{
+			Transport: req.Transport,
+			Jar:       map[string]string{"session_id": "from-app"},
+		})
+	})
+	time.Sleep(100 * time.Millisecond)
+
+	raw.FireCaptcha("smartcaptcha")
+
+	select {
+	case req := <-asked:
+		if req.Transport != "yandex" || req.URL != "https://x" || req.Reason != "smartcaptcha" {
+			t.Fatalf("the app was asked for %+v", req)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the app was never asked to pass the check")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if raw.getJar()["session_id"] == "from-app" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("cookies not applied: %+v", raw.getJar())
+}
+
+// quietCarrier is a transport that never raises checks.
+type quietCarrier struct{}
+
+func (quietCarrier) Start() error                    { return nil }
+func (quietCarrier) Stop() error                     { return nil }
+func (quietCarrier) Send([]byte) error               { return nil }
+func (quietCarrier) Receive(func([]byte))            {}
+func (quietCarrier) IsConnected() bool               { return true }
+func (quietCarrier) Stats() transport.TransportStats { return transport.TransportStats{} }
+
+// A carrier that never raises checks (boards, mailru, cups.online) is left alone.
+func TestWireCheckSkipsQuiet(t *testing.T) {
+	srv := ipc.NewServer(filepath.Join(t.TempDir(), "oflx.sock"), &coreIPCHandler{})
+	if wireCheckNotifier(quietCarrier{}, srv) {
+		t.Fatal("wired a carrier that has no ErrorNotifier")
+	}
+}
+
 // A script transport asks for its own setup page, served by its own
 // httpserver.listen(), and the app answers it: script -> manager -> IPC ->
 // app (opens the page, the user submits) -> IPC -> manager -> script. The

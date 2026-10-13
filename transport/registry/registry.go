@@ -10,6 +10,7 @@ package registry
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -48,7 +49,7 @@ type Options struct {
 // existed; moving every user-facing word out of the core is a separate step.
 
 // Types are the transport types New accepts, in the order the apps list them.
-var Types = []string{"yandex", "vyandex", "boards", "mailru", "cupsonline", "avito", "oneme", "direct", "script"}
+var Types = []string{"yandex", "vyandex", "boards", "mailru", "cupsonline", "avito", "telemost", "oneme", "direct", "script"}
 
 // New builds the raw carrier of the given type. params carries what a type
 // needs beyond its url: "token"/"uid" (and "exit") for oneme, "dial"/"listen"
@@ -90,6 +91,8 @@ func New(typ, url string, params map[string]interface{}, o Options) (transport.T
 	case "oneme":
 		uid, _ := strconv.ParseInt(str("uid"), 10, 64)
 		return oneme.NewOneMeTransport(roleParam(params, "exit", o.IsExit), str("token"), uid, base), nil
+	case "telemost":
+		return newTelemost(url, params, o), nil
 	case "script":
 		return newScript(url, params, o)
 	case "direct":
@@ -97,6 +100,60 @@ func New(typ, url string, params map[string]interface{}, o Options) (transport.T
 	}
 	return nil, fmt.Errorf("unknown transport type %q", typ) // the apps never offer an unknown one
 }
+
+// newTelemost builds the Telemost carrier: a Yandex Telemost conference whose
+// SFU relays the tunnel as video. One Telemost stream tops out near 2 MB/s,
+// so the carrier always runs as a striped group of lanes (participants of the
+// same conference). params:
+//
+//	"stripes"     "auto" (the default): start at telemostLanes and add lanes
+//	              while they stay saturated; or a fixed lane count
+//	"stripes_max" upper bound for auto (default telemostMaxLanes)
+//	"cookies"     Yandex cookie header, only needed to create a conference
+//
+// Both ends of a tunnel stripe, so the two must be this build or later.
+func newTelemost(url string, params map[string]interface{}, o Options) transport.Transport {
+	str := func(key string) string {
+		switch v := params[key].(type) {
+		case string:
+			return v
+		case float64:
+			return strconv.Itoa(int(v))
+		case int:
+			return strconv.Itoa(v)
+		}
+		return ""
+	}
+	n, auto := telemostLanes, true
+	st := str("stripes")
+	if e := os.Getenv("TELEMOST_STRIPES"); e != "" { // debugging override
+		st = e
+	}
+	if v, err := strconv.Atoi(st); err == nil && v >= 1 {
+		n, auto = v, false
+	}
+	maxLanes, _ := strconv.Atoi(str("stripes_max"))
+	if e, err := strconv.Atoi(os.Getenv("TELEMOST_STRIPES_MAX")); err == nil {
+		maxLanes = e
+	}
+	if maxLanes < 1 {
+		maxLanes = telemostMaxLanes
+	}
+	if maxLanes < n {
+		maxLanes = n
+	}
+	g := yandex.NewTelemostGroup(str("cookies"), url, n, o.IsExit, o.Base)
+	return transport.NewStripedTransportAuto(g.Lanes(), g, maxLanes, auto)
+}
+
+// A Telemost carrier starts with telemostLanes lanes and adds one whenever
+// they stay saturated, up to telemostMaxLanes; one stream carries up to about
+// 2 MB/s. Whichever side adds a lane, the other mirrors it, so the two sides
+// of a tunnel pair lane for lane.
+const (
+	telemostLanes    = 3
+	telemostMaxLanes = 6
+)
 
 // roleParam reads a role flag a profile may carry as a bool or as "true".
 func roleParam(params map[string]interface{}, key string, def bool) bool {

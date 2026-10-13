@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -19,7 +18,6 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/p1neappleXpress/OpenFlux/netbind"
 	"github.com/p1neappleXpress/OpenFlux/transport"
 	"github.com/p1neappleXpress/OpenFlux/utils"
 )
@@ -330,10 +328,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		// insufficient on iOS).
 		dialer := websocket.Dialer{
 			HandshakeTimeout: 15 * time.Second,
-			NetDialContext: netbind.Wrap(&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
+			NetDialContext:   dialIPv4First,
 		}
 		headers := http.Header{}
 		headers.Set("User-Agent", "Mozilla/5.0")
@@ -457,7 +452,12 @@ func (t *YandexDocsTransport) writerLoop() {
 		}
 
 		payload := base64.StdEncoding.EncodeToString(pending)
-		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
+		// The cursor's numeric prefix must equal the actual binary packet
+		// length (before Base64), not a fixed constant: Yandex Disk does not
+		// relay cursor messages whose declared length does not match, so the
+		// hardcoded "18" silently dropped every packet and the VPN handshake
+		// timed out. Reported with an A/B wire test by @Gamazzz (issue #165).
+		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"%d;%s"}]`, len(pending), payload)
 		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
 			utils.Debugf("[YDOCS] Write error: %v", err)
 			time.Sleep(15 * time.Millisecond)
@@ -752,7 +752,8 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	}
 
 	client := &http.Client{
-		Jar: jar,
+		Jar:       jar,
+		Transport: carrierTransport(),
 		// НЕ следуем редиректам автоматически — обрабатываем вручную.
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
